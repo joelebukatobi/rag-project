@@ -4,7 +4,7 @@ AI Engineering project for Fordham University.
 
 ## Team
 - Joel Ebukatobi (Co-author)
-- [Classmate Name] (Co-author)
+- Claudia Gisemba (Co-author)
 
 ## Course
 - Course: AI Engineering
