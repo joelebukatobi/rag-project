@@ -9,3 +9,4 @@ faiss-cpu
 rank-bm25
 tqdm
 edgartools
+altair<5
