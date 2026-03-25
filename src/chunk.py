@@ -32,9 +32,15 @@ SECTION_PATTERNS = {
 }
 
 
-def _clean_text(text: str) -> str:
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+def _clean_text(text: object) -> str:
+    """Safely clean text by handling non-string types and whitespace."""
+    # If it's not a string, or it's null, return empty string
+    if not isinstance(text, str):
+        return ""
+    
+    # Perform regex substitution for multiple whitespaces
+    cleaned = re.sub(r"\s+", " ", text)
+    return cleaned.strip()
 
 
 def extract_sections_from_text(raw_text: str) -> Dict[str, str]:
@@ -52,33 +58,61 @@ def extract_sections_from_text(raw_text: str) -> Dict[str, str]:
 
     return found
 
-
+#New version
 def parse_sections(df_filings: pd.DataFrame, target_sections: Optional[Sequence[str]] = None) -> pd.DataFrame:
-    """
-    Build a section-level DataFrame from raw filings.
-
-    Output columns: ticker, year, section_type, section_text.
-    """
     if target_sections is None:
-        target_sections = list(SECTION_PATTERNS.keys())
+        target_sections = ["section_1a", "section_7", "section_3"]
 
     rows: List[Dict[str, object]] = []
+    
     for row in tqdm(df_filings.itertuples(index=False), total=len(df_filings), desc="Parsing sections"):
-        section_map = extract_sections_from_text(row.raw_text)
         for section_type in target_sections:
-            section_text = section_map.get(section_type, "")
-            if not section_text:
+            # Grab the column value
+            val = getattr(row, section_type, "")
+            
+            # Ensure we treat it as a string
+            section_text = str(val) if val is not None else ""
+            
+            if len(section_text.strip()) < 10:
                 continue
-            rows.append(
-                {
-                    "ticker": row.ticker,
-                    "year": int(row.year),
-                    "section_type": section_type,
-                    "section_text": section_text,
-                }
-            )
+                
+            rows.append({
+                "ticker": row.ticker,
+                "year": int(row.year),
+                "section_type": section_type,
+                "section_text": _clean_text(section_text), # Now safely a string
+            })
 
     return pd.DataFrame(rows)
+
+
+#Previous
+# def parse_sections(df_filings: pd.DataFrame, target_sections: Optional[Sequence[str]] = None) -> pd.DataFrame:
+#     """
+#     Build a section-level DataFrame from raw filings.
+
+#     Output columns: ticker, year, section_type, section_text.
+#     """
+#     if target_sections is None:
+#         target_sections = list(SECTION_PATTERNS.keys())
+
+#     rows: List[Dict[str, object]] = []
+#     for row in tqdm(df_filings.itertuples(index=False), total=len(df_filings), desc="Parsing sections"):
+#         section_map = extract_sections_from_text(row.raw_text)
+#         for section_type in target_sections:
+#             section_text = section_map.get(section_type, "")
+#             if not section_text:
+#                 continue
+#             rows.append(
+#                 {
+#                     "ticker": row.ticker,
+#                     "year": int(row.year),
+#                     "section_type": section_type,
+#                     "section_text": section_text,
+#                 }
+#             )
+
+#     return pd.DataFrame(rows)
 
 
 def section_coverage_stats(df_sections: pd.DataFrame) -> pd.DataFrame:

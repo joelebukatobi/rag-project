@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import os
 import json
 from typing import Dict
+
+import dill as pickle
+import numpy as np
 
 import streamlit as st
 
@@ -9,22 +13,72 @@ from src.chunk import build_chunks, parse_sections
 from src.embed import embed_chunks
 from src.evaluate import build_test_set, run_retrieval_eval
 from src.generate import compare, generate_structured_output
-from src.ingest import load_raw_filings
+from src.ingest import load_live_filings
 from src.retrieve import HybridRetriever
+
+from dotenv import load_dotenv
+load_dotenv()
 
 st.set_page_config(page_title="SEC Filings RAG", page_icon="📄", layout="wide")
 
-
 @st.cache_resource(show_spinner=False)
 def initialize_pipeline() -> Dict[str, object]:
-    tickers = ["TSLA", "AAPL", "MSFT", "AMZN", "NVDA"]
-    year_range = (2018, 2023)
+    CHUNKS_PATH = "data/chunks.pkl"
+    EMBEDDINGS_PATH = "data/embeddings.pkl"
+    os.makedirs("data", exist_ok=True)
 
-    df = load_raw_filings(tickers=tickers, year_range=year_range, filing_type="10-K")
-    df_sections = parse_sections(df)
-    all_chunks = build_chunks(df_sections, chunk_size=800, chunk_overlap=200, cache_path="data/chunks.pkl")
-    vectors, metadata = embed_chunks(all_chunks, cache_path="data/embeddings.pkl")
-    retriever = HybridRetriever(vectors=vectors, metadata=metadata, semantic_weight=0.6, lexical_weight=0.4)
+    # Initialize variables to None to prevent NameErrors later
+    all_chunks, vectors, metadata = None, None, None
+    df, df_sections = None, None
+    loaded_from_cache = False
+
+    # 1. ATTEMPT CACHE LOAD
+    if os.path.exists(CHUNKS_PATH) and os.path.exists(EMBEDDINGS_PATH):
+            try:
+                with open(CHUNKS_PATH, "rb") as f:
+                    all_chunks = pickle.load(f)
+                with open(EMBEDDINGS_PATH, "rb") as f:
+                    raw_data = pickle.load(f)
+                
+                # --- Dictionary-Safe Unpacking ---
+                if isinstance(raw_data, dict):
+                    vectors = raw_data.get("vectors")
+                    metadata = raw_data.get("metadata")
+                else:
+                    # Fallback if it was saved as a tuple (vectors, metadata)
+                    vectors, metadata = raw_data
+                
+                # CRITICAL: Convert the actual data to numpy, not the string keys!
+                vectors = np.array(vectors)
+                
+                loaded_from_cache = True
+                st.sidebar.success(f"Loaded data from local cache.")
+            except Exception as e:
+                st.sidebar.warning(f" Cache corrupted or incompatible: {e}")
+                loaded_from_cache = False
+
+    # 2. FALLBACK TO INGESTION (If cache failed or doesn't exist)
+    if not loaded_from_cache:
+        st.info("🔄 Cache missing or invalid. Starting fresh SEC ingestion...")
+        
+        tickers = ["TSLA", "AAPL", "CCL", "AMZN", "NVDA"]
+        year_range = (2018, 2023)
+        
+        # Run the full pipeline
+        df = load_live_filings(tickers=tickers, year_range=year_range)
+        df_sections = parse_sections(df)
+        all_chunks = build_chunks(df_sections, cache_path=CHUNKS_PATH)
+        vectors, metadata = embed_chunks(all_chunks, cache_path=EMBEDDINGS_PATH)
+        
+        vectors = np.array(vectors)
+
+    # 3. BUILD RETRIEVER
+    retriever = HybridRetriever(
+        vectors=vectors, 
+        metadata=metadata, 
+        semantic_weight=0.6, 
+        lexical_weight=0.4
+    )
 
     return {
         "df": df,
@@ -34,7 +88,6 @@ def initialize_pipeline() -> Dict[str, object]:
         "metadata": metadata,
         "retriever": retriever,
     }
-
 
 st.title("Analyst-Ready SEC Filings RAG System")
 st.caption("Structured comparative intelligence across 10-K filing years")
