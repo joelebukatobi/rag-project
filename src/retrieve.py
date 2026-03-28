@@ -51,18 +51,24 @@ class HybridRetriever:
         year: Optional[int] = None,
         section_type: Optional[str] = None,
         top_k: int = 5,
+        use_bm25: bool = True,
+        use_metadata_filter: bool = True,
     ) -> List[Dict[str, object]]:
         """
-        Hybrid retrieval with metadata filtering first, then FAISS+BM25 reranking.
+        Hybrid retrieval with optional metadata filtering and BM25 lexical scoring.
+        Disable either component for ablation studies.
         """
-        candidates = self._candidate_indices(ticker=ticker, year=year, section_type=section_type)
+        if use_metadata_filter:
+            candidates = self._candidate_indices(ticker=ticker, year=year, section_type=section_type)
+        else:
+            candidates = list(range(len(self.metadata)))
+
         if not candidates:
             return []
 
         candidate_meta = [self.metadata[i] for i in candidates]
         candidate_vecs = self.vectors[candidates].astype("float32")
 
-        # Semantic scoring on filtered candidates.
         q_vec = self.embed_model.encode([query], normalize_embeddings=True, convert_to_numpy=True).astype("float32")
         faiss.normalize_L2(candidate_vecs)
         sub_index = faiss.IndexFlatIP(candidate_vecs.shape[1])
@@ -71,25 +77,26 @@ class HybridRetriever:
         sem_scores, sem_ids = sub_index.search(q_vec, min(top_k * 4, len(candidate_meta)))
         semantic_map = {int(i): float(s) for i, s in zip(sem_ids[0], sem_scores[0])}
 
-        # Lexical BM25 scoring on filtered candidates.
-        tokenized = [str(m["text"]).lower().split() for m in candidate_meta]
-        bm25 = BM25Okapi(tokenized)
-        bm25_scores = bm25.get_scores(query.lower().split())
+        if use_bm25:
+            tokenized = [str(m["text"]).lower().split() for m in candidate_meta]
+            bm25 = BM25Okapi(tokenized)
+            bm25_scores = bm25.get_scores(query.lower().split())
 
-        # Min-max normalization keeps semantic and lexical scores comparable.
-        bm25_min = float(np.min(bm25_scores))
-        bm25_max = float(np.max(bm25_scores))
+            bm25_min = float(np.min(bm25_scores))
+            bm25_max = float(np.max(bm25_scores))
 
-        def norm_bm25(v: float) -> float:
-            if bm25_max - bm25_min < 1e-9:
-                return 0.0
-            return (float(v) - bm25_min) / (bm25_max - bm25_min)
+            def norm_bm25(v: float) -> float:
+                if bm25_max - bm25_min < 1e-9:
+                    return 0.0
+                return (float(v) - bm25_min) / (bm25_max - bm25_min)
 
         merged = []
         for local_idx, meta in enumerate(candidate_meta):
             sem = semantic_map.get(local_idx, 0.0)
-            lex = norm_bm25(float(bm25_scores[local_idx]))
-            final = self.semantic_weight * sem + self.lexical_weight * lex
+            lex = norm_bm25(float(bm25_scores[local_idx])) if use_bm25 else 0.0
+            sem_w = 1.0 if not use_bm25 else self.semantic_weight
+            lex_w = 0.0 if not use_bm25 else self.lexical_weight
+            final = sem_w * sem + lex_w * lex
             merged.append(
                 {
                     **meta,
