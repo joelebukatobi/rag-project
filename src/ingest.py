@@ -82,20 +82,30 @@ def load_live_filings(tickers, year_range):
                     # Item 3 (Legal)
                     legal = tenk["Item 3"] or ""
 
-                    rows.append({
+                    row = {
                         "ticker": ticker.upper(),
                         "year": f_year,
                         "company": filing.company,
                         "section_1a": str(risk_factors),
                         "section_7": str(mda),
                         "section_8": str(financials),
-                        "section_3": str(legal)
-                    })
+                        "section_3": str(legal),
+                    }
+                    section_cols = ["section_1a", "section_7", "section_8", "section_3"]
+                    if any(row[s].strip() for s in section_cols):
+                        rows.append(row)
         except Exception as e:
             print(f"Skipping {ticker} year {f_year if 'f_year' in locals() else 'unknown'} due to error: {e}")
             continue
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        section_cols = ["section_1a", "section_7", "section_8", "section_3"]
+        df["_content_len"] = df[section_cols].apply(lambda r: sum(len(s) for s in r), axis=1)
+        df = df.sort_values("_content_len", ascending=False).drop_duplicates(
+            subset=["ticker", "year"], keep="first"
+        ).drop(columns=["_content_len"]).sort_values(["ticker", "year"]).reset_index(drop=True)
+    return df
 
 
 # Used Parquet
