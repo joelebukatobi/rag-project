@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -19,23 +19,29 @@ class EvalCase:
     expected_keywords: List[str]
 
 
-def build_test_set() -> List[EvalCase]:
-    """Create a representative 20-query test set template."""
+def build_test_set(
+    tickers: Optional[List[str]] = None,
+    years: Optional[List[int]] = None,
+    max_cases: int = 20,
+) -> List[EvalCase]:
+    """Create a representative test set from the given tickers and years."""
     templates = [
         ("supply chain risk changes", "section_1a", ["supply", "vendor"]),
         ("regulatory and compliance exposure", "section_1a", ["regulation", "compliance"]),
         ("demand trends by segment", "section_7", ["segment", "demand"]),
         ("litigation and legal actions", "section_3", ["litigation", "legal"]),
     ]
-    tickers = ["AAPL", "MSFT", "AMZN", "NVDA", "TSLA"]
-    years = [2019, 2020, 2021, 2022]
+    if tickers is None:
+        tickers = ["AAPL", "MSFT", "AMZN", "NVDA", "TSLA"]
+    if years is None:
+        years = [2019, 2020, 2021, 2022]
 
     out: List[EvalCase] = []
     for t in tickers:
         for y in years:
             q, section, kws = templates[(y - years[0]) % len(templates)]
             out.append(EvalCase(query=q, ticker=t, section_type=section, year=y, expected_keywords=kws))
-    return out[:20]
+    return out[:max_cases]
 
 
 def recall_at_k(results: List[Dict[str, object]], expected_keywords: List[str], k: int = 5) -> float:
@@ -82,15 +88,20 @@ def run_retrieval_eval(
     retriever: HybridRetriever,
     test_set: List[EvalCase],
     top_k: int = 5,
+    use_bm25: bool = True,
+    use_metadata_filter: bool = True,
+    label: str = "Running retrieval eval",
 ) -> pd.DataFrame:
     rows = []
-    for case in tqdm(test_set, desc="Running retrieval eval"):
+    for case in tqdm(test_set, desc=label):
         res = retriever.retrieve(
             query=case.query,
             ticker=case.ticker,
             year=case.year,
             section_type=case.section_type,
             top_k=top_k,
+            use_bm25=use_bm25,
+            use_metadata_filter=use_metadata_filter,
         )
         rows.append(
             {
@@ -106,24 +117,33 @@ def run_retrieval_eval(
     return pd.DataFrame(rows)
 
 
-def ablation_table(base_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Build a simple ablation view placeholders from baseline metrics.
-    This keeps notebook flows reproducible even before full controlled reruns.
-    """
-    if base_df.empty:
-        return pd.DataFrame(columns=["setup", "Recall@5", "MRR"])
-
-    recall = float(np.mean(base_df["Recall@5"]))
-    mean_mrr = float(np.mean(base_df["MRR"]))
-    data = [
-        {"setup": "Hybrid + Metadata + Rerank", "Recall@5": recall, "MRR": mean_mrr},
-        {"setup": "No BM25", "Recall@5": max(0.0, recall - 0.05), "MRR": max(0.0, mean_mrr - 0.04)},
-        {
-            "setup": "No Metadata Filtering",
-            "Recall@5": max(0.0, recall - 0.08),
-            "MRR": max(0.0, mean_mrr - 0.06),
-        },
-        {"setup": "No Reranker", "Recall@5": max(0.0, recall - 0.03), "MRR": max(0.0, mean_mrr - 0.03)},
+def ablation_table(
+    retriever: HybridRetriever,
+    test_set: List[EvalCase],
+    top_k: int = 5,
+) -> pd.DataFrame:
+    """Run retrieval eval under different configurations for a real ablation study."""
+    configs = [
+        {"setup": "Hybrid + Metadata Filter", "use_bm25": True, "use_metadata_filter": True},
+        {"setup": "No BM25 (Semantic Only)", "use_bm25": False, "use_metadata_filter": True},
+        {"setup": "No Metadata Filtering", "use_bm25": True, "use_metadata_filter": False},
+        {"setup": "Semantic Only, No Filter", "use_bm25": False, "use_metadata_filter": False},
     ]
-    return pd.DataFrame(data)
+
+    rows = []
+    for cfg in configs:
+        df = run_retrieval_eval(
+            retriever,
+            test_set,
+            top_k=top_k,
+            use_bm25=cfg["use_bm25"],
+            use_metadata_filter=cfg["use_metadata_filter"],
+            label=cfg["setup"],
+        )
+        rows.append({
+            "setup": cfg["setup"],
+            "Recall@5": round(float(df["Recall@5"].mean()), 3),
+            "MRR": round(float(df["MRR"].mean()), 3),
+        })
+
+    return pd.DataFrame(rows)
