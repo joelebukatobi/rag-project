@@ -94,7 +94,7 @@ st.caption("Structured comparative intelligence across 10-K filing years")
 
 with st.sidebar:
     st.header("Controls")
-    ticker = st.selectbox("Company ticker", ["TSLA", "AAPL", "MSFT", "AMZN", "NVDA"], index=0)
+    ticker = st.selectbox("Company ticker", ["TSLA", "AAPL", "AMZN", "NVDA", "CCL"], index=0)
     section_label = st.selectbox("Section", ["Risk Factors", "MD&A", "Legal Proceedings"], index=0)
     year_a = st.selectbox("Year A", [2018, 2019, 2020, 2021, 2022, 2023], index=2)
     year_b = st.selectbox("Year B", [2018, 2019, 2020, 2021, 2022, 2023], index=5)
