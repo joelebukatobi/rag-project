@@ -18,6 +18,34 @@ def _build_context(chunks: List[Dict[str, object]], label: str) -> str:
     return "\n".join(lines)
 
 
+_SECTION_PROMPTS = {
+    "section_1a": (
+        "You are analyzing SEC 10-K Risk Factors (Item 1A) filings.\n"
+        "Compare the two sets of excerpts and provide findings for ALL of the following:\n"
+        "1) Risk Changes: new risks added, risks removed, risks expanded or reduced\n"
+        "2) Revenue Drivers: any mentions of revenue segments, demand trends, or growth drivers\n"
+        "3) Litigation Changes: any legal proceedings, lawsuits, or regulatory actions mentioned\n"
+        "4) Tone Shifts: changes in cautious vs optimistic language\n"
+    ),
+    "section_7": (
+        "You are analyzing SEC 10-K MD&A (Item 7) filings.\n"
+        "Compare the two sets of excerpts and provide findings for ALL of the following:\n"
+        "1) Revenue Drivers: changes in revenue segments, product lines, geographic markets, demand trends\n"
+        "2) Risk Changes: operational or financial risks discussed in the management analysis\n"
+        "3) Litigation Changes: any legal or regulatory matters impacting financial performance\n"
+        "4) Tone Shifts: changes in management's outlook, confidence, or forward-looking language\n"
+    ),
+    "section_3": (
+        "You are analyzing SEC 10-K Legal Proceedings (Item 3) filings.\n"
+        "Compare the two sets of excerpts and provide findings for ALL of the following:\n"
+        "1) Litigation Changes: lawsuits added, resolved, ongoing, or escalated\n"
+        "2) Risk Changes: legal risks that could impact the business\n"
+        "3) Revenue Drivers: any financial impact or settlements affecting revenue\n"
+        "4) Tone Shifts: changes in how the company characterizes legal exposure\n"
+    ),
+}
+
+
 def compare(
     retriever: HybridRetriever,
     ticker: str,
@@ -34,15 +62,11 @@ def compare(
     chunks_a = retriever.retrieve(query=query, ticker=ticker, year=year_a, section_type=section_type, top_k=top_k)
     chunks_b = retriever.retrieve(query=query, ticker=ticker, year=year_b, section_type=section_type, top_k=top_k)
 
-    prompt = f"""
-You are a financial filings comparison analyst.
-Compare the two sets of SEC filing excerpts and detect:
-1) new items
-2) removed items
-3) expanded items
-4) tone shifts
+    section_guidance = _SECTION_PROMPTS.get(section_type, _SECTION_PROMPTS["section_1a"])
 
-Return concise but concrete findings with citations to chunk_id.
+    prompt = f"""
+{section_guidance}
+For each finding, cite the relevant chunk_id. If a category has no findings, explicitly state "No significant changes found."
 
 {_build_context(chunks_a, f'Year {year_a}')}
 
@@ -147,8 +171,19 @@ def generate_structured_output(
         "citations": ["string"],
     }
 
+    section_type = diff_result.get("section_type", "section_1a")
+    section_names = {
+        "section_1a": "Risk Factors (Item 1A)",
+        "section_7": "MD&A (Item 7)",
+        "section_3": "Legal Proceedings (Item 3)",
+    }
+    section_name = section_names.get(section_type, "SEC Filing")
+
     prompt = f"""
-Transform the following filing comparison into strict JSON matching this schema exactly.
+Transform the following {section_name} comparison into strict JSON matching this schema exactly.
+ALL array fields (risk_changes, revenue_drivers, litigation_changes) MUST be populated with
+any relevant findings from the comparison. Extract and categorize every finding into the
+appropriate field. Do not leave arrays empty if the comparison text contains relevant information.
 Do not add markdown. Return JSON only.
 
 Schema:
