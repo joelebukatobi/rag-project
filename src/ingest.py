@@ -53,59 +53,74 @@ def _build_raw_text(record: dict) -> str:
             section_blobs.append(f"{key.upper()}\n{val.strip()}")
     return "\n\n".join(section_blobs)
 
-#Uses edgar tools d
-def load_live_filings(tickers, year_range):
+#Uses edgar tools 
+def load_live_filings(tickers: Iterable[str], year_range: Tuple[int, int]) -> pd.DataFrame:
+    """
+    Enhanced Ingestion: Captures structural sections and metadata 
+    to support the Credit Signal Taxonomy.
+    """
     rows = []
     year_min, year_max = year_range
 
-    for ticker in tqdm(tickers, desc="Processing Tickers"):
+    for ticker in tqdm(tickers, desc="Ingesting SEC Corpus"):
         try:
             company = Company(ticker)
             filings = company.get_filings(form="10-K")
-            if not filings: continue
+            if not filings:
+                continue
 
             for filing in filings:
                 f_year = filing.filing_date.year
                 if year_min <= f_year <= year_max:
                     
-                    # 1. Get the structured TenK object
+                    # Get the structured TenK object
                     tenk = filing.obj()
                     
-                    # 2. Extract Sections (Item 1A, 7, and 8)
-                    # We use .get() or dictionary access to avoid AttributeErrors
-                    risk_factors = getattr(tenk, "risk_factors", "") or tenk["Item 1A"] or ""
-                    mda = getattr(tenk, "management_discussion", "") or tenk["Item 7"] or ""
+                    # --- SIGNAL TAXONOMY MAPPING ---
+                    # Item 1: Business (Business Fragility Signals)
+                    item_1 = tenk["Item 1"] or ""
                     
-                    # Item 8 (Financials) is where the Debt Tables live
-                    financials = tenk["Item 8"] or ""
+                    # Item 1A: Risk Factors (Risk Disclosure Signals)
+                    item_1a = tenk["Item 1A"] or getattr(tenk, "risk_factors", "") or ""
                     
-                    # Item 3 (Legal)
-                    legal = tenk["Item 3"] or ""
+                    # Item 3: Legal (Litigation Escalation Signals)
+                    item_3 = tenk["Item 3"] or ""
+                    
+                    # Item 7: MD&A (Liquidity & Financial Stress Signals)
+                    item_7 = tenk["Item 7"] or getattr(tenk, "management_discussion", "") or ""
+                    
+                    # Item 8: Financials (Debt/Refinancing meta-checks)
+                    item_8 = tenk["Item 8"] or ""
 
                     row = {
                         "ticker": ticker.upper(),
                         "year": f_year,
                         "company": filing.company,
-                        "section_1a": str(risk_factors),
-                        "section_7": str(mda),
-                        "section_8": str(financials),
-                        "section_3": str(legal),
+                        "section_1": str(item_1),
+                        "section_1a": str(item_1a),
+                        "section_3": str(item_3),
+                        "section_7": str(item_7),
+                        "section_8": str(item_8),
+                        # --- META SIGNALS (v1) ---
+                        "len_1a": len(str(item_1a)),
+                        "len_7": len(str(item_7)),
+                        "len_3": len(str(item_3))
                     }
-                    section_cols = ["section_1a", "section_7", "section_8", "section_3"]
-                    if any(row[s].strip() for s in section_cols):
+                    
+                    # Only add if we have core analytical content
+                    if any(len(row[s]) > 500 for s in ["section_1a", "section_7"]):
                         rows.append(row)
+                        
         except Exception as e:
-            print(f"Skipping {ticker} year {f_year if 'f_year' in locals() else 'unknown'} due to error: {e}")
+            print(f"Skipping {ticker} due to extraction error: {e}")
             continue
 
     df = pd.DataFrame(rows)
     if not df.empty:
-        section_cols = ["section_1a", "section_7", "section_8", "section_3"]
-        df["_content_len"] = df[section_cols].apply(lambda r: sum(len(s) for s in r), axis=1)
-        df = df.sort_values("_content_len", ascending=False).drop_duplicates(
-            subset=["ticker", "year"], keep="first"
-        ).drop(columns=["_content_len"]).sort_values(["ticker", "year"]).reset_index(drop=True)
-    return df
+        # Cleanup: Ensure unique filings per year
+        df = df.sort_values(["ticker", "year"]).drop_duplicates(subset=["ticker", "year"], keep="last")
+        
+    return df.reset_index(drop=True)
 
 
 # Used Parquet

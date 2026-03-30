@@ -32,7 +32,7 @@ def build_test_set(
         ("litigation and legal actions", "section_3", ["litigation", "legal"]),
     ]
     if tickers is None:
-        tickers = ["AAPL", "MSFT", "AMZN", "NVDA", "TSLA"]
+        tickers = ["AAPL", "MSFT", "AMZN", "NVDA", "TSLA","CCL"]
     if years is None:
         years = [2019, 2020, 2021, 2022]
 
