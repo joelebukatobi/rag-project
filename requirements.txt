@@ -5,6 +5,7 @@ datasets
 pandas
 numpy
 sentence-transformers
+peft
 faiss-cpu
 rank-bm25
 tqdm

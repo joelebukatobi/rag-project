@@ -9,10 +9,13 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import pandas as pd
 from tqdm.auto import tqdm
 
+# EXPANDED: Labels to match your new Taxonomy (Items 1, 1A, 3, 7, 8)
 SECTION_LABELS = {
+    "section_1": "Business Description",
     "section_1a": "Risk Factors",
-    "section_7": "MD&A",
     "section_3": "Legal Proceedings",
+    "section_7": "MD&A",
+    "section_8": "Financial Statements",
 }
 
 
@@ -58,29 +61,31 @@ def extract_sections_from_text(raw_text: str) -> Dict[str, str]:
 
     return found
 
-#New version
+# --- PARSING LOGIC ---
 def parse_sections(df_filings: pd.DataFrame, target_sections: Optional[Sequence[str]] = None) -> pd.DataFrame:
+    """
+    Parses the expanded set of sections required for the Credit Signal Taxonomy.
+    """
     if target_sections is None:
-        target_sections = ["section_1a", "section_7", "section_3"]
+        target_sections = list(SECTION_LABELS.keys())
 
     rows: List[Dict[str, object]] = []
     
     for row in tqdm(df_filings.itertuples(index=False), total=len(df_filings), desc="Parsing sections"):
         for section_type in target_sections:
-            # Grab the column value
             val = getattr(row, section_type, "")
-            
-            # Ensure we treat it as a string
             section_text = str(val) if val is not None else ""
             
-            if len(section_text.strip()) < 10:
+            if len(section_text.strip()) < 50: # Increased threshold for signal quality
                 continue
                 
             rows.append({
                 "ticker": row.ticker,
                 "year": int(row.year),
                 "section_type": section_type,
-                "section_text": _clean_text(section_text), # Now safely a string
+                "section_text": _clean_text(section_text),
+                # TAXONOMY ENHANCEMENT: Store raw length for Meta Signal #18
+                "section_char_len": len(section_text) 
             })
 
     return pd.DataFrame(rows)
@@ -148,7 +153,11 @@ def _chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
     return chunks
 
 
+# --- CHUNKING LOGIC ---
 def _chunk_row(args: Tuple[Dict[str, object], int, int]) -> List[Dict[str, object]]:
+    """
+    Enhanced chunker that attaches 'Section Meta-Signals' to every chunk.
+    """
     row, chunk_size, chunk_overlap = args
     section_chunks = _chunk_text(str(row["section_text"]), chunk_size, chunk_overlap)
 
@@ -160,12 +169,14 @@ def _chunk_row(args: Tuple[Dict[str, object], int, int]) -> List[Dict[str, objec
                 "year": int(row["year"]),
                 "section_type": row["section_type"],
                 "chunk_id": f"{row['ticker']}-{row['year']}-{row['section_type']}-{idx}",
-                "source": f"{row['ticker']}_{row['year']}_10k",
                 "text": chunk_text,
+                # TAXONOMY METADATA: 
+                # This helps the AI identify 'Disclosure Length' shifts (Signal 18)
+                "meta_section_len": row["section_char_len"], 
+                "label": SECTION_LABELS.get(str(row["section_type"]), "General")
             }
         )
     return out
-
 
 def build_chunks(
     df_sections: pd.DataFrame,
