@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import pickle
+import streamlit as st # Added for caching
 from multiprocessing import cpu_count
 from typing import Dict, List, Tuple
 
@@ -9,8 +10,9 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 from tqdm.auto import tqdm
 
-
-def _load_model(model_name: str = "all-MiniLM-L6-v2") -> SentenceTransformer:
+# SPEED FIX: Cache the model so it stays in RAM across searches
+@st.cache_resource
+def _get_model(model_name: str = "all-MiniLM-L6-v2") -> SentenceTransformer:
     return SentenceTransformer(model_name)
 
 
@@ -22,7 +24,7 @@ def embed_chunks(
 ) -> Tuple[np.ndarray, List[Dict[str, object]]]:
     """
     Embed chunk text and cache vectors. 
-    Now supports incremental updates (only embeds what is missing).
+    Optimized for RAM persistence and per-filing caching.
     """
     existing_vectors = np.array([]).reshape(0, 0)
     existing_metadata = []
@@ -31,21 +33,19 @@ def embed_chunks(
     if os.path.exists(cache_path):
         with open(cache_path, "rb") as f:
             data = pickle.load(f)
-            existing_vectors = data["vectors"]
-            existing_metadata = data["metadata"]
+            # Support both Dict and Tuple formats for flexibility
+            if isinstance(data, dict):
+                existing_vectors = data.get("vectors", np.array([]))
+                existing_metadata = data.get("metadata", [])
+            else:
+                existing_vectors, existing_metadata = data
         
-        # Create a set of unique IDs already embedded to avoid duplicates
-        # Using chunk_id as the unique key
         seen_ids = {m.get("chunk_id") for m in existing_metadata if m.get("chunk_id")}
-        
-        # Filter all_chunks to only those NOT in seen_ids
         chunks_to_embed = [c for c in all_chunks if c.get("chunk_id") not in seen_ids]
         
         if not chunks_to_embed:
-            print("✅ All tickers/chunks already present in cache. Skipping embedding.")
+            # IMPORTANT: Return existing directly to avoid redundant work
             return existing_vectors, existing_metadata
-        
-        print(f"🔄 Found {len(chunks_to_embed)} new chunks to add to cache.")
     else:
         chunks_to_embed = all_chunks
 
@@ -53,9 +53,11 @@ def embed_chunks(
         return existing_vectors, existing_metadata
 
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-    model = _load_model(model_name)
+    
+    # SPEED FIX: Use the cached model getter
+    model = _get_model(model_name)
 
-    # 2. Prepare Metadata for NEW chunks
+    # 2. Prepare Metadata
     new_texts = [str(c["text"]) for c in chunks_to_embed]
     new_metadata = []
     for c in chunks_to_embed:
@@ -70,11 +72,11 @@ def embed_chunks(
             "label": c.get("label", "General")
         })
 
-    # 3. Generate NEW Vectors
+    # 3. Generate NEW Vectors (Batch processing)
     new_vectors = model.encode(
         new_texts,
         batch_size=batch_size,
-        show_progress_bar=True,
+        show_progress_bar=False, # Disabled for cleaner Streamlit UI
         convert_to_numpy=True,
         normalize_embeddings=True, 
     ).astype("float32")
@@ -87,15 +89,15 @@ def embed_chunks(
         final_vectors = new_vectors
         final_metadata = new_metadata
 
+    # Consistently save as a dictionary for easier loading
     payload = {"vectors": final_vectors, "metadata": final_metadata}
     
     with open(cache_path, "wb") as f:
         pickle.dump(payload, f)
 
-    return payload["vectors"], payload["metadata"]
+    return final_vectors, final_metadata
 
 def embedding_info(vectors: np.ndarray) -> Dict[str, int]:
-    """Diagnostic info for the CreditDelta vector store."""
     if vectors.size == 0:
         return {"count": 0, "dimension": 0, "workers": cpu_count()}
 
