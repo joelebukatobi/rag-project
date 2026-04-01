@@ -98,7 +98,29 @@ def compare(
         - Cite specific chunk IDs for every signal detected.
         - If a section length (Meta Signal #18) has changed significantly, flag it.
         - Distinguish between 'Boilerplate' and 'Material' changes.
-        - Distinguish between 'Market Risk' and 'Credit Stress' per the Rules above
+        - Distinguish between 'Market Risk' and 'Credit Stress' per the Rules above.
+
+        VERIFIABILITY MANDATE (STRICT):
+        - Every finding MUST include at least one specific, Google-verifiable data point.
+        - Include exact dollar amounts (e.g., "$31.9B total debt"), percentages (e.g., "revenue up 37% YoY"),
+          dates, entity/counterparty names, regulatory body names, case numbers, or geographic jurisdictions.
+        - Quote exact phrases from the filing where possible, in single quotes.
+        - If the filing states a specific figure, include it verbatim — do NOT paraphrase numbers.
+        - Preference: a reader should be able to copy a key phrase from your finding, paste it into Google,
+          and find a corroborating source (earnings report, news article, court filing).
+
+        ANTI-VAGUENESS RULE:
+        - NEVER output a finding that merely restates boilerplate filing language.
+        - If the filing mentions a regulation, NAME the specific regulation (e.g., "SEC Rule 15c3-3", "EU GDPR", "CCPA").
+        - If the filing mentions lawsuits, NAME the parties, jurisdiction, and amounts if available.
+        - If the filing mentions a market/product, NAME the specific market, product line, or geography.
+        - If the source text is genuinely vague, you MUST still add context: state WHAT the vague language
+          most likely refers to based on the company's known business, and flag it as 'Boilerplate — low
+          analytical value' so the reader knows it lacks specificity.
+        - BAD example: "The regulation of certain transactions involving virtual goods and cryptocurrencies"
+        - GOOD example: "Nike's 2023 10-K added new risk language around digital asset regulation, likely
+          referencing Nike's .SWOOSH NFT platform launched in Nov 2022. No specific regulatory action cited —
+          this appears to be precautionary boilerplate ahead of anticipated SEC digital asset rulemaking."
 
     {_build_context(chunks_a, f'BASE YEAR {year_a}')}
 
@@ -134,19 +156,19 @@ def generate_structured_output(
 
     # Define the target JSON structure for the UI
     schema_hint = {
-        "executive_summary": "High-conviction BLUF of strategic/financial shifts.",
+        "executive_summary": "High-conviction BLUF of strategic/financial shifts. Include key dollar figures and percentages.",
         "findings": [
             {
                 "category": "STRATEGIC | REGULATORY | FINANCIAL | GOVERNANCE",
                 "materiality": "HIGH | MEDIUM | LOW | MARKET",
                 "title": "Finding Headline",
-                "evidence": "Detailed excerpt from text",
+                "evidence": "Must include specific verifiable facts: exact dollar amounts, percentages, dates, entity names, or quoted filing language. A reader should be able to Google a key phrase from this field and find a corroborating source.",
                 "verdict": "Underwriting conclusion citing the Gatekeeper rule applied",
                 "source": "Chunk ID"
             }
         ],
         "strategic_outlook": {
-            "primary_driver": "The most significant delta found",
+            "primary_driver": "The most significant delta found, with specific figures",
             "net_posture": "STABLE | CAUTIONARY | IMPROVING",
             "liquidity_buffer": "Statement on 5x/10% rule status"
         }
@@ -165,6 +187,13 @@ def generate_structured_output(
     2. If a risk is mitigated by liquidity (5x Rule), mark as 'LOW MATERIALITY'.
     3. Categorize Interest-Rate debt fluctuations as 'MARKET MATERIALITY'.
     4. Provide the 'net_posture' based on the cumulative materiality of findings.
+    5. CRITICAL — Every 'evidence' field MUST contain at least one specific, verifiable fact:
+       exact dollar amounts, percentages, YoY changes, entity names, regulatory bodies,
+       court case references, or direct quotes from the filing in single quotes.
+       Do NOT paraphrase numbers — use the exact figures from the source text.
+    6. NEVER echo vague filing language as evidence. If the filing says "certain regulations"
+       you MUST name WHICH regulations. If it says "certain products" you MUST name WHICH products.
+       If the source is genuinely vague, explain what it likely refers to and flag as boilerplate.
 
     ANALYSIS DATA TO CONVERT:
     {diff_result.get('raw_diff', '')}

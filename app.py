@@ -148,10 +148,16 @@ def inject_executive_css():
             .card-status { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; padding: 2px 10px; border: 1px solid #0a0a0a; border-radius: 999px; }
             .card-body { font-size: 0.95rem; line-height: 1.55; }
 
-            /* Materiality tags: monochrome */
-            .status-high { background: #0a0a0a; color: #ffffff; border-color: #0a0a0a; }
-            .status-medium { background: #ffffff; color: #0a0a0a; border-color: #0a0a0a; }
-            .status-low { background: #ffffff; color: #0a0a0a; border-color: #d0d0d0; }
+            /* Materiality tags: colored backgrounds + white text */
+            .status-high { background: #dc2626; color: #ffffff; border-color: #dc2626; }
+            .status-medium { background: #f59e0b; color: #ffffff; border-color: #f59e0b; }
+            .status-low { background: #16a34a; color: #ffffff; border-color: #16a34a; }
+            .status-market { background: #2563eb; color: #ffffff; border-color: #2563eb; }
+
+            /* Posture tags */
+            .status-cautionary { background: #f59e0b; color: #ffffff; border-color: #f59e0b; }
+            .status-stable { background: #16a34a; color: #ffffff; border-color: #16a34a; }
+            .status-improving { background: #2563eb; color: #ffffff; border-color: #2563eb; }
 
             /* Results anchor spacing */
             .results-anchor { scroll-margin-top: 24px; }
@@ -422,13 +428,14 @@ if run:
             )
             outlook = report.get("strategic_outlook", {})
             posture = str(outlook.get("net_posture", "STABLE")).upper()
+            posture_class = f"status-{posture.lower()}"
             driver = outlook.get("primary_driver", "N/A")
             st.markdown(
                 f"""
                 <div class="exec-card">
                     <div class="card-header">
                         <span class="card-label">OUTLOOK</span>
-                        <span class="card-status">{posture}</span>
+                        <span class="card-status {posture_class}">{posture}</span>
                     </div>
                     <div class="card-body">{driver}</div>
                 </div>
