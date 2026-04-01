@@ -302,7 +302,7 @@ with st.container():
             section_label = st.selectbox("Section", SECTION_OPTIONS, index=1)
 
         y1, y2 = st.columns(2, gap="large")
-        years = list(range(2018, 2024))
+        years = list(range(2018, 2026))
         with y1:
             y_a = st.selectbox("Base Year", years, index=years.index(2020))
         with y2:
