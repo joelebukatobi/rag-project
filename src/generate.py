@@ -1,9 +1,20 @@
 from __future__ import annotations
 
+import hashlib
 import json
-from typing import Dict, List, Tuple
+import os
+import pickle
+from typing import Any, Dict, List, Optional
+
 from openai import OpenAI
 from src.retrieve import HybridRetriever
+from src.view_schemas import (
+    REPORT_PROMPT_VERSION,
+    build_schema_for_view,
+    normalize_view,
+    schema_as_json_str,
+    view_role_block,
+)
 
 def _build_context(chunks: List[Dict[str, object]], label: str) -> str:
     """Builds a structured context window for the model."""
@@ -136,80 +147,244 @@ def compare(
         temperature=0,
     )
 
+    cids_a = sorted(
+        {str(c.get("chunk_id", "")) for c in chunks_a if c.get("chunk_id")}
+    )
+    cids_b = sorted(
+        {str(c.get("chunk_id", "")) for c in chunks_b if c.get("chunk_id")}
+    )
     return {
         "ticker": ticker,
         "section_type": section_type,
         "year_a": year_a,
         "year_b": year_b,
         "raw_diff": response.choices[0].message.content,
+        "chunk_ids_a": cids_a,
+        "chunk_ids_b": cids_b,
     }
+
+
+def _report_cache_path(cache_dir: str, key: str) -> str:
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, f"{key}.pkl")
+
+
+def _load_report_cache(cache_dir: str, key: str) -> Optional[Dict[str, Any]]:
+    path = _report_cache_path(cache_dir, key)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _save_report_cache(cache_dir: str, key: str, report: Dict[str, Any]) -> None:
+    path = _report_cache_path(cache_dir, key)
+    with open(path, "wb") as f:
+        pickle.dump(report, f)
+
+
+def _fingerprint_key(payload: Dict[str, Any]) -> str:
+    blob = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
 
 def generate_structured_output(
     diff_result: Dict[str, object],
     model: str = "gpt-4o-mini",
-) -> Dict[str, object]:
-    """
-    Maps the raw taxonomy analysis into a professional Underwriting Report.
-    Uses the 5x and 10% Gatekeepers to determine Materiality levels.
-    """
+    *,
+    view: str = "Risk Analyst",
+    section_type: str = "",
+) -> Dict[str, Any]:
     client = OpenAI()
+    v = normalize_view(view)
+    schema_hint = build_schema_for_view(v)
+    role = view_role_block(v)
 
-    # Define the target JSON structure for the UI
-    schema_hint = {
-        "executive_summary": "High-conviction BLUF of strategic/financial shifts. Include key dollar figures and percentages.",
-        "findings": [
-            {
-                "category": "STRATEGIC | REGULATORY | FINANCIAL | GOVERNANCE",
-                "materiality": "HIGH | MEDIUM | LOW | MARKET",
-                "title": "Finding Headline",
-                "evidence": "Must include specific verifiable facts: exact dollar amounts, percentages, dates, entity names, or quoted filing language. A reader should be able to Google a key phrase from this field and find a corroborating source.",
-                "verdict": "Underwriting conclusion citing the Gatekeeper rule applied",
-                "source": "Chunk ID"
-            }
-        ],
-        "strategic_outlook": {
-            "primary_driver": "The most significant delta found, with specific figures",
-            "net_posture": "STABLE | CAUTIONARY | IMPROVING",
-            "liquidity_buffer": "Statement on 5x/10% rule status"
-        }
-    }
+    board_cap = ""
+    if v == "Board":
+        board_cap = "Limit 'findings' to at most 5 items. Prioritize highest materiality. "
 
-    # Construct the final transformation prompt
     prompt = f"""
-    ROLE: Senior Credit Committee Member
-    TASK: Convert Delta Analysis into an Underwriting Report.
-    
-    UNDERWRITING GATEKEEPERS:
-    {_UNDERWRITING_MATERIALITY_GUIDE}
+{role}
+TASK: Convert the Delta Analysis into a structured report for view="{v}".
 
-    INSTRUCTIONS:
-    1. For every finding, apply the 5x Liquidity and 10% Legal thresholds.
-    2. If a risk is mitigated by liquidity (5x Rule), mark as 'LOW MATERIALITY'.
-    3. Categorize Interest-Rate debt fluctuations as 'MARKET MATERIALITY'.
-    4. Provide the 'net_posture' based on the cumulative materiality of findings.
-    5. CRITICAL — Every 'evidence' field MUST contain at least one specific, verifiable fact:
-       exact dollar amounts, percentages, YoY changes, entity names, regulatory bodies,
-       court case references, or direct quotes from the filing in single quotes.
-       Do NOT paraphrase numbers — use the exact figures from the source text.
-    6. NEVER echo vague filing language as evidence. If the filing says "certain regulations"
-       you MUST name WHICH regulations. If it says "certain products" you MUST name WHICH products.
-       If the source is genuinely vague, explain what it likely refers to and flag as boilerplate.
+{board_cap}
+UNDERWRITING GATEKEEPERS:
+{_UNDERWRITING_MATERIALITY_GUIDE}
 
-    ANALYSIS DATA TO CONVERT:
-    {diff_result.get('raw_diff', '')}
+INSTRUCTIONS:
+1. For every finding, apply the 5x Liquidity and 10% Legal thresholds.
+2. If a risk is mitigated by liquidity (5x Rule), mark as 'LOW MATERIALITY' where applicable.
+3. Categorize Interest-Rate debt fluctuations as 'MARKET MATERIALITY' when market-driven.
+4. Provide the 'strategic_outlook' consistent with the evidence.
+5. Every 'evidence' field must contain at least one verifiable fact, quote, or number from the analysis, with chunk ID(s) in 'source' where possible.
+6. For view-specific keys (e.g. judge_scores, omission_analysis, meta_signals), only fill if part of the schema; use numbers 0-100 for scores where requested.
 
-    OUTPUT FORMAT (Strict JSON):
-    {json.dumps(schema_hint)}
-    """
+ANALYSIS DATA TO CONVERT:
+{diff_result.get('raw_diff', '')}
+
+OUTPUT FORMAT (strict JSON; match this structure, including optional keys for this view):
+{schema_as_json_str(schema_hint)}
+""".strip()
 
     response = client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": "You are a specialized Credit Analytics Engine that outputs strictly valid JSON for executive review."},
+            {
+                "role": "system",
+                "content": "You are a specialized Credit Analytics Engine. Output only valid JSON matching the requested view schema.",
+            },
             {"role": "user", "content": prompt},
         ],
         response_format={"type": "json_object"},
         temperature=0,
     )
-    
+
     return json.loads(response.choices[0].message.content)
+
+
+def _enrich_post(
+    report: Dict[str, Any],
+    view: str,
+    *,
+    section_len_a: int,
+    section_len_b: int,
+) -> Dict[str, Any]:
+    v = normalize_view(view)
+    if v == "Board":
+        find = report.get("findings")
+        if isinstance(find, list) and len(find) > 5:
+            report["findings"] = find[:5]
+    if v == "Research":
+        ms = report.get("meta_signals")
+        if not isinstance(ms, dict):
+            report["meta_signals"] = {}
+            ms = report["meta_signals"]
+        growth = None
+        if section_len_a:
+            growth = (section_len_b - section_len_a) / float(section_len_a) * 100.0
+        ms["section_char_len_year_a"] = int(section_len_a)
+        ms["section_char_len_year_b"] = int(section_len_b)
+        ms["disclosure_growth_pct"] = None if growth is None else round(growth, 2)
+    return report
+
+
+def _merge_provenance(
+    report: Dict[str, Any],
+    *,
+    view: str,
+    model: str,
+    top_k: int,
+    acc_a: str,
+    acc_b: str,
+    fin_fp: str,
+) -> None:
+    rep = report.get("provenance")
+    if not isinstance(rep, dict):
+        rep = {}
+    rep.update(
+        {
+            "prompt_version": REPORT_PROMPT_VERSION,
+            "view": normalize_view(view),
+            "model": model,
+            "top_k": top_k,
+            "filing_accession_no_year_a": acc_a,
+            "filing_accession_no_year_b": acc_b,
+            "evidence_fingerprint_sha256": fin_fp,
+        }
+    )
+    report["provenance"] = rep
+
+
+def generate_report(
+    retriever: HybridRetriever,
+    ticker: str,
+    section_type: str,
+    year_a: int,
+    year_b: int,
+    query: str,
+    top_k: int = 10,
+    model: str = "gpt-4o-mini",
+    view: Optional[str] = None,
+    provenance: Optional[Dict[str, Any]] = None,
+    section_len_a: int = 0,
+    section_len_b: int = 0,
+    cache_dir: str = "data/reports",
+) -> Dict[str, Any]:
+    """
+    Two-step flow: compare() then view-specific generate_structured_output().
+    Caches the final report JSON on evidence + view + version (see Implementation.md).
+    """
+    v = normalize_view(view)
+    pa = str((provenance or {}).get("year_a", {}).get("accession_no", "")) if isinstance(provenance, dict) else ""  # noqa: E501
+    pb = str((provenance or {}).get("year_b", {}).get("accession_no", "")) if isinstance(provenance, dict) else ""  # noqa: E501
+
+    diff = compare(
+        retriever=retriever,
+        ticker=ticker,
+        section_type=section_type,
+        year_a=year_a,
+        year_b=year_b,
+        query=query,
+        top_k=top_k,
+        model=model,
+    )
+    cids_a = list(diff.get("chunk_ids_a") or [])
+    cids_b = list(diff.get("chunk_ids_b") or [])
+
+    fin_payload: Dict[str, Any] = {
+        "report_prompt_version": REPORT_PROMPT_VERSION,
+        "model": model,
+        "view": v,
+        "ticker": str(ticker).upper(),
+        "section_type": section_type,
+        "year_a": int(year_a),
+        "year_b": int(year_b),
+        "query": query,
+        "top_k": int(top_k),
+        "chunk_ids_a": cids_a,
+        "chunk_ids_b": cids_b,
+        "accession_a": pa,
+        "accession_b": pb,
+    }
+    fin_fp = _fingerprint_key(fin_payload)
+    cache_key = _fingerprint_key({"fingerprint": fin_fp, "role": "final_report_v1"})
+
+    cached = _load_report_cache(cache_dir, cache_key)
+    if cached is not None and isinstance(cached, dict) and cached.get("executive_summary") is not None:  # noqa: E501
+        return cached
+
+    struct = generate_structured_output(
+        diff,
+        model,
+        view=v,
+        section_type=section_type,
+    )
+    if not isinstance(struct, dict):
+        struct = {"executive_summary": "", "findings": [], "strategic_outlook": {}}
+    struct = _enrich_post(
+        struct, v, section_len_a=section_len_a, section_len_b=section_len_b
+    )
+    struct["view"] = v
+
+    if isinstance(provenance, dict):
+        struct["filing"] = {
+            "year_a": provenance.get("year_a"),
+            "year_b": provenance.get("year_b"),
+        }
+    _merge_provenance(
+        struct,
+        view=v,
+        model=model,
+        top_k=top_k,
+        acc_a=pa,
+        acc_b=pb,
+        fin_fp=fin_fp,
+    )
+
+    _save_report_cache(cache_dir, cache_key, struct)
+    return struct

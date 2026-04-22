@@ -126,5 +126,11 @@ class HybridRetriever:
                 "final_score": final_score,
             })
 
-        merged.sort(key=lambda x: x["final_score"], reverse=True)
+        # Deterministic ordering: break ties by chunk_id for stable caching/output.
+        merged.sort(
+            key=lambda x: (
+                -float(x.get("final_score", 0.0)),
+                str(x.get("chunk_id", "")),
+            )
+        )
         return merged[:top_k]

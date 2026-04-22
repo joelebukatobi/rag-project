@@ -9,12 +9,14 @@ from typing import Dict, List, Any
 import numpy as np
 import streamlit as st
 import streamlit.components.v1 as components
+import textwrap
 from edgar import Company, set_identity
 
 # Custom Logic Imports
 from src.chunk import build_chunks
 from src.embed import embed_chunks
-from src.generate import compare, generate_structured_output
+from src.filing_select import accession_to_slug, pick_filing_for_year
+from src.generate import generate_report
 from src.retrieve import HybridRetriever
 
 from dotenv import load_dotenv
@@ -167,78 +169,198 @@ def inject_executive_css():
     )
 
 
-def render_exec_card(data: Dict[str, Any]):
+def render_exec_card(data: Dict[str, Any], *, show_category_label: bool = True):
     materiality = str(data.get("materiality", "Low")).upper()
     m_class = f"status-{materiality.lower()}"
-    st.markdown(
-        f"""
-        <div class="exec-card">
-            <div class="card-header">
-                <span class="card-label">{str(data.get("category", "General")).upper()}</span>
-                <span class="card-status {m_class}">{materiality} MATERIALITY</span>
-            </div>
-            <div class="card-body">{data.get("evidence", "No specific snippet found.")}</div>
-            <div style="margin-top: 10px; padding: 8px; background: #f8fafc; border-left: 3px solid #1c2e4a; font-size: 0.85rem; font-weight: 600;">
-                {data.get("verdict", "Monitor for developments.")}
-            </div>
-        </div>
-    """,
-        unsafe_allow_html=True,
+    category_html = ""
+    if show_category_label:
+        category_html = f"<span class='card-label'>{str(data.get('category', 'General')).upper()}</span>"
+    # Important: no leading indentation on lines, otherwise Streamlit may render as a code block.
+    html = (
+        f"<div class=\"exec-card\">"
+        f"<div class=\"card-header\">"
+        f"{category_html}"
+        f"<span class=\"card-status {m_class}\">{materiality} MATERIALITY</span>"
+        f"</div>"
+        f"<div class=\"card-body\">{data.get('evidence', 'No specific snippet found.')}</div>"
+        f"<div style=\"margin-top: 10px; padding: 8px; background: #f8fafc; border-left: 3px solid #1c2e4a; "
+        f"font-size: 0.85rem; font-weight: 600;\">"
+        f"{data.get('verdict', 'Monitor for developments.')}"
+        f"</div>"
+        f"</div>"
     )
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def _extract_section_text_with_tier(tenk_obj, section_id: str):
+    """Return (text, tier_name) for provenance."""
+    item_id = section_id.replace("section_", "Item ").upper()
+    attr_map = {
+        "section_1": "business",
+        "section_1a": "risk_factors",
+        "section_3": "legal_proceedings",
+        "section_7": "management_discussion",
+        "section_8": "financial_statements",
+    }
+    raw_content = getattr(tenk_obj, attr_map.get(section_id, ""), "")
+    tier = "attr"
+    if not raw_content or len(str(raw_content)) < 500:
+        try:
+            raw_content = tenk_obj[item_id]
+            tier = "item_index"
+        except Exception:
+            raw_content = tenk_obj.section(item_id)
+            tier = "section"
+    return str(raw_content), tier
 
 
 @st.cache_data(show_spinner=False)
-def get_filing_data(ticker: str, year: int, section_id: str):
-    file_id = f"{ticker}_{year}_{section_id}"
-    chunk_path = f"{CACHE_DIR}/{file_id}_chunks.pkl"
-    vec_path = f"{CACHE_DIR}/{file_id}_vecs.pkl"
+def get_filing_data(
+    ticker: str,
+    year: int,
+    section_id: str,
+    use_amended_10k: bool = False,
+):
+    def _provenance_dict(filing, extraction_tier: str, raw_len: int) -> Dict[str, Any]:
+        por = getattr(filing, "period_of_report", None) or getattr(
+            filing, "report_date", None
+        )
+        fd = getattr(filing, "filing_date", None) or getattr(filing, "date", None)
+        acc = getattr(filing, "accession_no", None)
+        form = str(getattr(filing, "form", None) or "")
+        return {
+            "ticker": ticker.upper(),
+            "fiscal_year": int(year),
+            "section_id": section_id,
+            "accession_no": str(acc) if acc is not None else "",
+            "form": form,
+            "period_of_report": str(por) if por is not None else "",
+            "filing_date": str(fd) if fd is not None else "",
+            "extraction_tier": extraction_tier,
+            "section_char_len": int(raw_len),
+        }
 
-    # 1. Instant Cache Return
-    if os.path.exists(chunk_path) and os.path.exists(vec_path):
+    def _load_legacy() -> Any:
+        file_id = f"{ticker}_{year}_{section_id}"
+        chunk_path = f"{CACHE_DIR}/{file_id}_chunks.pkl"
+        vec_path = f"{CACHE_DIR}/{file_id}_vecs.pkl"
+        if not (os.path.exists(chunk_path) and os.path.exists(vec_path)):
+            return None
         with open(chunk_path, "rb") as f:
             chunks = pickle.load(f)
         with open(vec_path, "rb") as f:
             p = pickle.load(f)
-            return (chunks, p["vectors"]) if isinstance(p, dict) else (chunks, p[0])
+            vecs = p["vectors"] if isinstance(p, dict) else p[0]
+        prov: Dict[str, Any] = {
+            "ticker": ticker.upper(),
+            "fiscal_year": int(year),
+            "section_id": section_id,
+            "accession_no": "",
+            "form": "",
+            "period_of_report": "",
+            "filing_date": "",
+            "extraction_tier": "legacy_cache",
+            "section_char_len": int(
+                next((m.get("meta_section_len", 0) for m in chunks), 0) or 0
+            ),
+            "cache_note": "Pre-accession cache file; re-fetch will pin accession.",
+        }
+        return {
+            "chunks": chunks,
+            "vecs": vecs,
+            "error": None,
+            "provenance": prov,
+        }
 
     try:
         company = Company(ticker)
-        filings = company.get_filings(form="10-K").filter(
-            date=f"{year}-01-01:{year}-12-31"
+        if use_amended_10k:
+            f10 = company.get_filings(form="10-K")
+            f10a = company.get_filings(form="10-K/A")
+            all_filings = list(f10) + list(f10a)
+        else:
+            all_filings = list(company.get_filings(form="10-K"))
+        if not all_filings:
+            return {
+                "chunks": None,
+                "vecs": None,
+                "error": f"No 10-K filings found for {ticker}.",
+                "provenance": None,
+            }
+
+        filing, pick_err = pick_filing_for_year(
+            all_filings, int(year), use_amended_10k=use_amended_10k
         )
-        if not filings:
-            return None, None
+        if not filing:
+            leg = _load_legacy()
+            if leg is not None:
+                return leg
+            return {
+                "chunks": None,
+                "vecs": None,
+                "error": pick_err
+                or f"Could not select a 10-K for FY{year} ({ticker}).",
+                "provenance": None,
+            }
 
-        # Get the TenK object
-        tenk = filings[0].obj()
+        acc = getattr(filing, "accession_no", None) or "unknown"
+        acc_slug = accession_to_slug(str(acc))
+        file_id = f"{ticker}_{year}_{section_id}_{acc_slug}"
+        chunk_path = f"{CACHE_DIR}/{file_id}_chunks.pkl"
+        vec_path = f"{CACHE_DIR}/{file_id}_vecs.pkl"
+        prov_path = f"{CACHE_DIR}/{file_id}_provenance.json"
 
-        # Define the Item search string (e.g., 'Item 1' for 'section_1')
-        item_id = section_id.replace("section_", "Item ").upper()
+        if os.path.exists(chunk_path) and os.path.exists(vec_path):
+            with open(chunk_path, "rb") as f:
+                chunks = pickle.load(f)
+            with open(vec_path, "rb") as f:
+                p = pickle.load(f)
+                vecs = p["vectors"] if isinstance(p, dict) else p[0]
+            provenance: Dict[str, Any]
+            if os.path.exists(prov_path):
+                with open(prov_path, "r", encoding="utf-8") as f:
+                    provenance = json.load(f)
+            else:
+                provenance = {
+                    "ticker": ticker.upper(),
+                    "fiscal_year": int(year),
+                    "section_id": section_id,
+                    "accession_no": str(acc),
+                    "extraction_tier": "cache_hit",
+                    "section_char_len": int(
+                        next((m.get("meta_section_len", 0) for m in chunks), 0) or 0
+                    ),
+                }
+            return {
+                "chunks": chunks,
+                "vecs": vecs,
+                "error": None,
+                "provenance": provenance,
+            }
 
-        # Tier 1: Try direct edgartools attribute
-        attr_map = {
-            "section_1": "business",
-            "section_1a": "risk_factors",
-            "section_3": "legal_proceedings",
-            "section_7": "management_discussion",
-            "section_8": "financial_statements",
-        }
-        raw_content = getattr(tenk, attr_map.get(section_id, ""), "")
-
-        # Tier 2: If empty or too short, use the 'Item' indexer (The "NKE/TSLA" fix)
-        if not raw_content or len(str(raw_content)) < 500:
-            try:
-                # This scans the actual document map for the Item header
-                raw_content = tenk[item_id]
-            except:
-                # Tier 3: Hard slice
-                raw_content = tenk.section(item_id)
-
-        raw_text = str(raw_content)
+        tenk = filing.obj()
+        raw_text, ext_tier = _extract_section_text_with_tier(tenk, section_id)
         if len(raw_text) < 200:
-            return None, None
+            por = getattr(filing, "period_of_report", None) or getattr(
+                filing, "report_date", None
+            )
+            fd = getattr(filing, "filing_date", None) or getattr(filing, "date", None)
+            acc2 = getattr(filing, "accession_no", None)
+            return {
+                "chunks": None,
+                "vecs": None,
+                "error": (
+                    f"Extracted text too short for {ticker} FY{year} {section_id} "
+                    f"(len={len(raw_text)}). Filing: accession={acc2}, period_of_report={por}, "
+                    f"filing_date={fd}. Enable 'Use amended 10-K/A' only if you intend to use an amended filing."
+                ),
+                "provenance": _provenance_dict(filing, ext_tier, len(raw_text)),
+            }
 
-        # --- PROCESS PIPELINE ---
+        prov_save = _provenance_dict(filing, ext_tier, len(raw_text))
+        with open(prov_path, "w", encoding="utf-8") as f:
+            json.dump(prov_save, f, indent=2)
+
         df_temp = pd.DataFrame(
             [
                 {
@@ -253,11 +375,24 @@ def get_filing_data(ticker: str, year: int, section_id: str):
 
         chunks = build_chunks(df_temp, cache_path=chunk_path)
         vecs, metadata = embed_chunks(chunks, cache_path=vec_path)
-        return metadata, vecs
+        return {
+            "chunks": metadata,
+            "vecs": vecs,
+            "error": None,
+            "provenance": prov_save,
+        }
 
     except Exception as e:
         print(f"Error fetching {ticker} {section_id}: {e}")
-        return None, None
+        leg = _load_legacy()
+        if leg is not None:
+            return leg
+        return {
+            "chunks": None,
+            "vecs": None,
+            "error": f"Exception: {type(e).__name__}: {e}",
+            "provenance": None,
+        }
 
 
 # --- APP INTERFACE ---
@@ -307,6 +442,23 @@ with st.container():
         with c2:
             section_label = st.selectbox("Section", SECTION_OPTIONS, index=1)
 
+        view_label = st.selectbox(
+            "View",
+            [
+                "Board",
+                "Risk Analyst",
+                "Research",
+                "Legal & Compliance",
+                "Regulatory / Auditor",
+            ],
+            index=1,
+            help="Each view uses a different report shape and UI emphasis; see Implementation.md.",
+        )
+        use_amended_10k = st.checkbox(
+            "Use amended 10-K/A (optional; default is base 10-K only)",
+            value=False,
+        )
+
         y1, y2 = st.columns(2, gap="large")
         years = list(range(2018, 2026))
         with y1:
@@ -353,13 +505,21 @@ if run:
         st.stop()
 
     with st.spinner(f"Analyzing {ticker} FY{y_a} vs FY{y_b}..."):
-        chunks_a, vecs_a = get_filing_data(ticker, y_a, section_map[section_label])
-        chunks_b, vecs_b = get_filing_data(ticker, y_b, section_map[section_label])
+        a = get_filing_data(
+            ticker, y_a, section_map[section_label], use_amended_10k=use_amended_10k
+        )
+        b = get_filing_data(
+            ticker, y_b, section_map[section_label], use_amended_10k=use_amended_10k
+        )
+        chunks_a, vecs_a = a.get("chunks"), a.get("vecs")
+        chunks_b, vecs_b = b.get("chunks"), b.get("vecs")
 
         if chunks_a is None or chunks_b is None:
-            st.error(
-                f"Filing data unavailable for {ticker}. SEC may not have indexed this section yet."
-            )
+            st.error("Filing data unavailable for one or both years/sections.")
+            if a.get("error"):
+                st.caption(f"Base year error (FY{y_a}, {section_map[section_label]}): {a['error']}")
+            if b.get("error"):
+                st.caption(f"Target year error (FY{y_b}, {section_map[section_label]}): {b['error']}")
             st.stop()
 
         # Build Hybrid Retriever (Fast because model is already in RAM)
@@ -367,19 +527,29 @@ if run:
             vectors=np.vstack([vecs_a, vecs_b]), metadata=chunks_a + chunks_b
         )
 
-        diff = compare(
+        prov_a = a.get("provenance") or {}
+        prov_b = b.get("provenance") or {}
+        len_a = int(
+            prov_a.get("section_char_len", 0)
+            or next((m.get("meta_section_len", 0) for m in chunks_a), 0)
+        )
+        len_b = int(
+            prov_b.get("section_char_len", 0)
+            or next((m.get("meta_section_len", 0) for m in chunks_b), 0)
+        )
+
+        report = generate_report(
             retriever=retriever,
             ticker=ticker,
             section_type=section_map[section_label],
             year_a=int(y_a),
             year_b=int(y_b),
             query=query,
+            view=view_label,
+            provenance={"year_a": prov_a, "year_b": prov_b},
+            section_len_a=len_a,
+            section_len_b=len_b,
         )
-        report = generate_structured_output(diff)
-
-        # Meta-Signal Calculation
-        len_a = next((m["meta_section_len"] for m in chunks_a), 0)
-        len_b = next((m["meta_section_len"] for m in chunks_b), 0)
 
         # --- RENDER REPORT ---
         st.markdown(
@@ -390,9 +560,19 @@ if run:
         st.markdown("<hr style='border: none; border-top: 1px solid #e5e5e5; margin: 2rem 0;'>", unsafe_allow_html=True)
 
         st.markdown(
-            f"<h2 style='font-size: 1.4rem; margin-top: 0;'>Comparative Review: {ticker} (FY{y_a} vs FY{y_b})</h2>",
+            f"<h2 style='font-size: 1.4rem; margin-top: 0;'>Comparative Review: {ticker} (FY{y_a} vs FY{y_b})</h2>"
+            f"<div class='muted' style='margin: 0.25rem 0 0.5rem 0;'>View: <strong>{view_label}</strong></div>",
             unsafe_allow_html=True,
         )
+
+        with st.expander("Provenance & filing", expanded=False):
+            st.json(
+                {
+                    "year_a_filing": prov_a,
+                    "year_b_filing": prov_b,
+                    "report_provenance": report.get("provenance", {}),
+                }
+            )
 
         if len_a > 0:
             growth = ((len_b - len_a) / len_a) * 100
@@ -412,36 +592,114 @@ if run:
 
         st.markdown("<hr style='border: none; border-top: 1px solid #e5e5e5; margin: 2rem 0;'>", unsafe_allow_html=True)
 
-        c_left, c_right = st.columns(2)
-        with c_left:
-            st.markdown(
-                "<h3 style='font-size: 1.1rem; margin-top: 0;'>Operational & Risk Deltas</h3>",
-                unsafe_allow_html=True,
-            )
-            for finding in report.get("findings", []):
-                render_exec_card(finding)
+        # --- ROW LAYOUT (Outlook first, then deltas) ---
+        st.markdown(
+            "<h3 style='font-size: 1.1rem; margin-top: 0;'>Strategic Outlook</h3>",
+            unsafe_allow_html=True,
+        )
+        outlook = report.get("strategic_outlook", {})
+        posture = str(outlook.get("net_posture", "STABLE")).upper()
+        posture_class = f"status-{posture.lower()}"
+        driver = outlook.get("primary_driver", "N/A")
+        outlook_html = (
+            f"<div class=\"exec-card\">"
+            f"<div class=\"card-header\">"
+            f"<span class=\"card-label\">OUTLOOK</span>"
+            f"<span class=\"card-status {posture_class}\">{posture}</span>"
+            f"</div>"
+            f"<div class=\"card-body\">{driver}</div>"
+            f"</div>"
+        )
+        st.markdown(outlook_html, unsafe_allow_html=True)
 
-        with c_right:
+        st.markdown(
+            "<hr style='border: none; border-top: 1px solid #e5e5e5; margin: 1.5rem 0;'>",
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(
+            "<h3 style='font-size: 1.1rem; margin-top: 0;'>Operational & Risk Deltas</h3>",
+            unsafe_allow_html=True,
+        )
+        findings = list(report.get("findings", []) or [])
+        category_order = ["STRATEGIC", "FINANCIAL", "REGULATORY", "GOVERNANCE"]
+        # Order requested: highest risk first (red -> orange -> green -> market).
+        materiality_order = ["HIGH", "MEDIUM", "LOW", "MARKET"]
+        materiality_rank = {m: i for i, m in enumerate(materiality_order)}
+
+        def _normalize_category(raw: object) -> str:
+            s = str(raw or "").upper()
+            # If the model outputs combined strings like "STRATEGIC | REGULATORY", pick a primary bucket.
+            for key in category_order:
+                if key in s:
+                    return key
+            return "OTHER"
+
+        # Group by category, but order category sections by highest materiality present (Option 1).
+        cat_buckets = {c: [] for c in category_order}
+        cat_buckets["OTHER"] = []
+        for f in findings:
+            c = _normalize_category(f.get("category", ""))
+            cat_buckets[c].append(f)
+
+        def _bucket_best_rank(bucket: List[Dict[str, Any]]) -> int:
+            if not bucket:
+                return 999
+            ranks = [
+                materiality_rank.get(str(x.get("materiality", "")).upper().strip(), 999)
+                for x in bucket
+            ]
+            return min(ranks) if ranks else 999
+
+        ordered_categories = sorted(
+            [c for c in category_order if cat_buckets.get(c)],
+            key=lambda c: _bucket_best_rank(cat_buckets[c]),
+        )
+        if cat_buckets.get("OTHER"):
+            ordered_categories.append("OTHER")
+
+        for c in ordered_categories:
+            c_bucket = cat_buckets.get(c, [])
+            if not c_bucket:
+                continue
+
+            c_label = c if c != "OTHER" else "OTHER / UNCATEGORIZED"
             st.markdown(
-                "<h3 style='font-size: 1.1rem; margin-top: 0;'>Strategic Outlook</h3>",
+                f"<div class='muted' style='margin: 0.25rem 0 0.75rem 0; font-weight: 800;'>"
+                f"{c_label}</div>",
                 unsafe_allow_html=True,
             )
-            outlook = report.get("strategic_outlook", {})
-            posture = str(outlook.get("net_posture", "STABLE")).upper()
-            posture_class = f"status-{posture.lower()}"
-            driver = outlook.get("primary_driver", "N/A")
+
+            # Order findings within each category by materiality (highest risk first).
+            c_bucket.sort(
+                key=lambda x: materiality_rank.get(
+                    str(x.get("materiality", "")).upper().strip(), 999
+                )
+            )
+            for finding in c_bucket:
+                # Avoid repeating the category inside each card since we're already grouped.
+                render_exec_card(finding, show_category_label=False)
+
+        if view_label == "Research" and report.get("meta_signals"):
             st.markdown(
-                f"""
-                <div class="exec-card">
-                    <div class="card-header">
-                        <span class="card-label">OUTLOOK</span>
-                        <span class="card-status {posture_class}">{posture}</span>
-                    </div>
-                    <div class="card-body">{driver}</div>
-                </div>
-                """,
+                "<h3 style='font-size: 1.1rem; margin-top: 1.5rem;'>Multi-year meta-signals</h3>",
                 unsafe_allow_html=True,
             )
+            st.json(report["meta_signals"])
+
+        if view_label == "Legal & Compliance" and report.get("judge_scores"):
+            st.markdown(
+                "<h3 style='font-size: 1.1rem; margin-top: 1.5rem;'>Faithfulness (model check)</h3>",
+                unsafe_allow_html=True,
+            )
+            st.json(report["judge_scores"])
+
+        if view_label == "Regulatory / Auditor" and report.get("omission_analysis"):
+            st.markdown(
+                "<h3 style='font-size: 1.1rem; margin-top: 1.5rem;'>Omission and gap analysis</h3>",
+                unsafe_allow_html=True,
+            )
+            st.json(report["omission_analysis"])
 else:
     st.markdown(
         "<div class='muted'>Enter your inputs above and generate a report.</div>",

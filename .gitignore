@@ -5,5 +5,8 @@ __pycache__/
 .DS_Store
 .serena/
 
+# Local caches & generated artifacts (rebuild on each machine)
+data/**/*.pkl
+data/**/*_provenance.json
 data/*.pkl
 !data/.gitkeep
