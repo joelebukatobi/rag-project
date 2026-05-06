@@ -1,149 +1,98 @@
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Dict, List, Optional
-
+import json
 import numpy as np
-import pandas as pd
-from tqdm.auto import tqdm
+from typing import List, Dict, Any, Optional
+from openai import OpenAI
+from src.generate import generate_report
 
-from src.retrieve import HybridRetriever
+class CreditEvaluator:
+    def __init__(self, judge_model: str = "gpt-4o"):
+        self.client = OpenAI()
+        self.judge_model = judge_model
 
+    def evaluate_report(self, report: Dict[str, Any], context_chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Runs a 3-point inspection: Faithfulness, Gatekeeper Adherence, and Evidence Density.
+        """
+        # 1. Check Faithfulness (Did the model invent numbers?)
+        faithfulness = self._check_faithfulness(report, context_chunks)
+        
+        # 2. Check Gatekeeper Compliance (5x/10% Rules)
+        gatekeeper = self._check_gatekeeper_logic(report)
+        
+        # 3. Evidence Density (Verifiability)
+        evidence_score = self._calculate_evidence_density(report)
 
-@dataclass
-class EvalCase:
-    query: str
-    ticker: str
-    section_type: str
-    year: int
-    expected_keywords: List[str]
+        return {
+            "overall_score": round((faithfulness + gatekeeper + evidence_score) / 3, 2),
+            "metrics": {
+                "faithfulness": faithfulness,
+                "gatekeeper_compliance": gatekeeper,
+                "evidence_density": evidence_score
+            },
+            "status": "PASS" if faithfulness > 0.8 else "FAIL"
+        }
 
-
-def build_test_set(
-    tickers: Optional[List[str]] = None,
-    years: Optional[List[int]] = None,
-    max_cases: int = 20,
-) -> List[EvalCase]:
-    """Create a representative test set from the given tickers and years."""
-    templates = [
-        ("supply chain risk changes", "section_1a", ["supply", "vendor"]),
-        ("regulatory and compliance exposure", "section_1a", ["regulation", "compliance"]),
-        ("demand trends by segment", "section_7", ["segment", "demand"]),
-        ("litigation and legal actions", "section_3", ["litigation", "legal"]),
-    ]
-    if tickers is None:
-        tickers = ["AAPL", "MSFT", "AMZN", "NVDA", "TSLA","CCL"]
-    if years is None:
-        years = [2019, 2020, 2021, 2022]
-
-    out: List[EvalCase] = []
-    for t in tickers:
-        for y in years:
-            q, section, kws = templates[(y - years[0]) % len(templates)]
-            out.append(EvalCase(query=q, ticker=t, section_type=section, year=y, expected_keywords=kws))
-    return out[:max_cases]
-
-
-def recall_at_k(results: List[Dict[str, object]], expected_keywords: List[str], k: int = 5) -> float:
-    top = results[:k]
-    if not top:
-        return 0.0
-    joined = " ".join([str(r.get("text", "")).lower() for r in top])
-    hit = any(kw.lower() in joined for kw in expected_keywords)
-    return 1.0 if hit else 0.0
-
-
-def mrr(results: List[Dict[str, object]], expected_keywords: List[str]) -> float:
-    for rank, item in enumerate(results, start=1):
-        text = str(item.get("text", "")).lower()
-        if any(kw.lower() in text for kw in expected_keywords):
-            return 1.0 / rank
-    return 0.0
-
-
-def citation_grounding_score(structured_output: Dict[str, object]) -> float:
-    citations = structured_output.get("citations", [])
-    if not isinstance(citations, list) or not citations:
-        return 0.0
-    valid = [c for c in citations if isinstance(c, str) and len(c.strip()) > 0]
-    return len(valid) / len(citations)
-
-
-def structured_output_accuracy(structured_output: Dict[str, object]) -> float:
-    required = [
-        "company",
-        "filing_year_a",
-        "filing_year_b",
-        "risk_changes",
-        "revenue_drivers",
-        "litigation_changes",
-        "tone_shift",
-        "citations",
-    ]
-    ok = all(k in structured_output for k in required)
-    return 1.0 if ok else 0.0
-
-
-def run_retrieval_eval(
-    retriever: HybridRetriever,
-    test_set: List[EvalCase],
-    top_k: int = 5,
-    use_bm25: bool = True,
-    use_metadata_filter: bool = True,
-    label: str = "Running retrieval eval",
-) -> pd.DataFrame:
-    rows = []
-    for case in tqdm(test_set, desc=label):
-        res = retriever.retrieve(
-            query=case.query,
-            ticker=case.ticker,
-            year=case.year,
-            section_type=case.section_type,
-            top_k=top_k,
-            use_bm25=use_bm25,
-            use_metadata_filter=use_metadata_filter,
+    def _check_faithfulness(self, report: Dict[str, Any], chunks: List[Dict[str, Any]]) -> float:
+        """Uses LLM-as-a-Judge to verify claims against raw chunks."""
+        context_text = "\n".join([f"ID {c['chunk_id']}: {c['text'][:500]}" for c in chunks])
+        findings_text = json.dumps(report.get("findings", []))
+        
+        prompt = f"""
+        COMPARE THE FINDINGS TO THE SOURCE DATA.
+        SOURCE DATA: {context_text}
+        GENERATED FINDINGS: {findings_text}
+        
+        Identify any claims, dollar amounts, or percentages in the FINDINGS that do not exist in the SOURCE DATA.
+        Output a JSON: {{"hallucination_count": int, "total_claims": int}}
+        """
+        
+        res = self.client.chat.completions.create(
+            model=self.judge_model,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}
         )
-        rows.append(
-            {
-                "query": case.query,
-                "ticker": case.ticker,
-                "year": case.year,
-                "section_type": case.section_type,
-                "Recall@5": recall_at_k(res, case.expected_keywords, k=5),
-                "MRR": mrr(res, case.expected_keywords),
-            }
+        data = json.loads(res.choices[0].message.content)
+        return (data['total_claims'] - data['hallucination_count']) / max(data['total_claims'], 1)
+
+    def _check_gatekeeper_logic(self, report: Dict[str, Any]) -> float:
+        """Deterministic check for the 5x/10% underwriting rules."""
+        findings = report.get("findings", [])
+        if not findings: return 1.0
+        
+        score = 0
+        for f in findings:
+            # Rule: If materiality is HIGH, evidence must mention specific stress/thresholds
+            if f['materiality'] == "HIGH":
+                if any(x in f['evidence'].lower() for x in ["%", "$", "exceeds", "breach"]):
+                    score += 1
+            else:
+                score += 1
+        return score / len(findings)
+
+    def _calculate_evidence_density(self, report: Dict[str, Any]) -> float:
+        """Scores the 'verifiability' of the report based on ID citations."""
+        findings = report.get("findings", [])
+        if not findings: return 0.0
+        
+        cited = 0
+        for f in findings:
+            if f.get("source") and len(str(f["source"])) > 0:
+                cited += 1
+        return cited / len(findings)
+
+def run_benchmark(retriever, test_cases: List[Dict[str, Any]]):
+    evaluator = CreditEvaluator()
+    results = []
+    
+    for case in test_cases:
+        report = generate_report(
+            retriever, case['ticker'], case['section_type'], 
+            case['year_a'], case['year_b'], case['query']
         )
-
-    return pd.DataFrame(rows)
-
-
-def ablation_table(
-    retriever: HybridRetriever,
-    test_set: List[EvalCase],
-    top_k: int = 5,
-) -> pd.DataFrame:
-    """Run retrieval eval under different configurations for a real ablation study."""
-    configs = [
-        {"setup": "Hybrid + Metadata Filter", "use_bm25": True, "use_metadata_filter": True},
-        {"setup": "No BM25 (Semantic Only)", "use_bm25": False, "use_metadata_filter": True},
-        {"setup": "No Metadata Filtering", "use_bm25": True, "use_metadata_filter": False},
-        {"setup": "Semantic Only, No Filter", "use_bm25": False, "use_metadata_filter": False},
-    ]
-
-    rows = []
-    for cfg in configs:
-        df = run_retrieval_eval(
-            retriever,
-            test_set,
-            top_k=top_k,
-            use_bm25=cfg["use_bm25"],
-            use_metadata_filter=cfg["use_metadata_filter"],
-            label=cfg["setup"],
-        )
-        rows.append({
-            "setup": cfg["setup"],
-            "Recall@5": round(float(df["Recall@5"].mean()), 3),
-            "MRR": round(float(df["MRR"].mean()), 3),
-        })
-
-    return pd.DataFrame(rows)
+        # We need the chunks used for generation to evaluate faithfulness
+        chunks = retriever.retrieve(case['query'], ticker=case['ticker'], top_k=10)
+        
+        score = evaluator.evaluate_report(report, chunks)
+        results.append({"ticker": case['ticker'], "result": score})
+        
+    return results
