@@ -97,3 +97,5 @@ Open [`notebook.ipynb`](notebook.ipynb) and run sections in order if you are usi
 ## Deployment (Streamlit Community Cloud)
 
 Point the app entry to **`app.py`**. Set **`OPENAI_API_KEY`** (and any other secrets) in **Streamlit app secrets** (not in the repo). Pushes to the connected branch usually trigger a redeploy; confirm the deployed commit in the Cloud UI. **Private GitHub repos** work once Streamlit has been authorized to read private repositories. The public `*.streamlit.app` URL may still be reachable by anyone with the link unless you restrict access in Streamlit’s sharing settings for your plan.
+
+**Sleeping / slow first load:** On Community Cloud (especially the free tier), apps often **spin down after inactivity**. The hosted page may look offline or hang briefly—that is normal. Use the **Wake app** control if Streamlit shows it, or **refresh** the page and wait; the **first** visit after sleep can take **30–60+ seconds** while the container starts.
